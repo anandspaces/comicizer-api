@@ -1,0 +1,28 @@
+services:
+  comicizer-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: comicizer-api
+    ports:
+      - "8040:8040"
+    env_file:
+      - .env
+    volumes:
+      # Mount code for development (optional - remove in production)
+      - ./main.py:/app/main.py:ro
+      # Mount output directory for generated PDFs (optional)
+      - ./output:/app/output
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8040/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - comicizer-network
+
+networks:
+  comicizer-network:
+    driver: bridge
