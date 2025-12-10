@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import google.generativeai as genai
@@ -13,6 +13,9 @@ from reportlab.lib.utils import ImageReader
 from PIL import Image
 import json
 from dotenv import load_dotenv
+from datetime import datetime
+import uuid
+import httpx
 
 # Load environment variables from .env file
 load_dotenv()
@@ -34,6 +37,18 @@ TEXT_MODEL = 'gemini-3-pro-preview'
 IMAGE_MODEL = 'gemini-3-pro-image-preview'
 MAX_PAGES = 3
 
+# Storage configuration
+STORAGE_DIR = os.getenv("STORAGE_DIR", "/app/output")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8040")
+
+# Remote Database API configuration
+REMOTE_API_BASE_URL = os.getenv("REMOTE_API_BASE_URL", "https://dextora.org/api")
+REMOTE_API_XSRF_TOKEN = os.getenv("REMOTE_API_XSRF_TOKEN", "")
+REMOTE_API_SESSION = os.getenv("REMOTE_API_SESSION", "")
+
+# Create storage directory if it doesn't exist
+os.makedirs(STORAGE_DIR, exist_ok=True)
+
 # Configure Google Generative AI
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
@@ -44,11 +59,155 @@ genai.configure(api_key=API_KEY)
 # Request Models
 class TopicRequest(BaseModel):
     subject: str
+    subjectId: int
     topic: str
-    class_name: str
+    topicId: int
     chapter: str
+    chapterId: int
+    level: int  # class/grade level
+
+class ComicMetadata(BaseModel):
+    level: int
+    subjectId: int
+    chapterId: int
+    topicId: int
+    url: str
+
+class StoreComicRequest(BaseModel):
+    level: int
+    subjectId: int
+    chapterId: int
+    topicId: int
+    url: str
+
+class CheckComicRequest(BaseModel):
+    level: int
+    subjectId: int
+    chapterId: int
+    topicId: int
 
 # Helper Functions
+def save_pdf_to_storage(pdf_bytes: bytes, filename: str) -> str:
+    """Save PDF to storage and return the URL"""
+    # Generate unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = str(uuid.uuid4())[:8]
+    safe_filename = f"{timestamp}_{unique_id}_{filename}"
+    
+    # Save to storage directory
+    file_path = os.path.join(STORAGE_DIR, safe_filename)
+    
+    with open(file_path, 'wb') as f:
+        f.write(pdf_bytes)
+    
+    # Generate URL
+    url = f"{BASE_URL}/downloads/{safe_filename}"
+    
+    print(f"PDF saved to: {file_path}")
+    print(f"Access URL: {url}")
+    
+    return url
+
+async def check_existing_comic(level: int, subject_id: int, chapter_id: int, topic_id: int) -> Optional[str]:
+    """Check if a comic already exists in the remote database"""
+    try:
+        # Prepare headers with authentication if available
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        cookies = {}
+        
+        if REMOTE_API_XSRF_TOKEN:
+            cookies["XSRF-TOKEN"] = REMOTE_API_XSRF_TOKEN
+        if REMOTE_API_SESSION:
+            cookies["laravel_session"] = REMOTE_API_SESSION
+        
+        # Make POST request to remote API (matching the Postman request format)
+        url = f"{REMOTE_API_BASE_URL}/get-comicizer"
+        form_data = {
+            "level": level,
+            "subjectId": subject_id,
+            "chapterId": chapter_id,
+            "topicId": topic_id
+        }
+        
+        print(f"Calling remote API: {url}")
+        print(f"Form data: {form_data}")
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(url, data=form_data, headers=headers, cookies=cookies)
+            
+            print(f"Remote API response status: {response.status_code}")
+            print(f"Remote API response body: {response.text[:500]}")  # First 500 chars
+            
+            if response.status_code == 200:
+                data = response.json()
+                print(f"Parsed JSON data: {data}")
+                
+                # Handle nested data structure: {"status": true, "data": {"url": "..."}}
+                if isinstance(data, dict):
+                    # Check if data has nested 'data' object
+                    if "data" in data and isinstance(data["data"], dict):
+                        url_value = data["data"].get("url")
+                    else:
+                        # Fallback to root level
+                        url_value = data.get("url")
+                    
+                    print(f"Extracted URL: {url_value}")
+                    return url_value
+            elif response.status_code == 404:
+                # Comic not found
+                print("Comic not found (404)")
+                return None
+            else:
+                print(f"Warning: Remote API returned status {response.status_code}")
+                return None
+                
+    except Exception as e:
+        print(f"Error checking existing comic: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        # On error, return None to proceed with generation
+        return None
+
+async def store_comic_metadata(level: int, subject_id: int, chapter_id: int, topic_id: int, url: str) -> bool:
+    """Store comic metadata in the remote database"""
+    try:
+        # Prepare headers with authentication if available
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        cookies = {}
+        
+        if REMOTE_API_XSRF_TOKEN:
+            cookies["XSRF-TOKEN"] = REMOTE_API_XSRF_TOKEN
+        if REMOTE_API_SESSION:
+            cookies["laravel_session"] = REMOTE_API_SESSION
+        
+        # Prepare form data (matching the Postman request format)
+        form_data = {
+            "level": level,
+            "subjectId": subject_id,
+            "chapterId": chapter_id,
+            "topicId": topic_id,
+            "url": url
+        }
+        
+        # Make POST request to remote API
+        api_url = f"{REMOTE_API_BASE_URL}/store-comicizer"
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(api_url, data=form_data, headers=headers, cookies=cookies)
+            
+            if response.status_code in [200, 201]:
+                print(f"Successfully stored comic metadata in remote database")
+                return True
+            else:
+                print(f"Warning: Remote API returned status {response.status_code}: {response.text}")
+                return False
+                
+    except Exception as e:
+        print(f"Error storing comic metadata: {str(e)}")
+        # On error, return False but don't fail the whole request
+        return False
+
+
 def analyze_content(content: str, context: str) -> str:
     """Analyze content and create comic-friendly summary"""
     prompt = f"""With Nobita and Doraemon as the main characters, create a comic format that guides readers to learn and understand this topic progressively from basic to advanced.
@@ -298,24 +457,49 @@ def create_comic_pdf(pages_data: list) -> bytes:
 async def root():
     return {
         "message": "Comicizer API - Transform educational content into comics!",
-        "version": "1.0.1 - Fixed page separation",
+        "version": "2.0.0 - Database Integration with Caching",
         "endpoints": {
-            "/generate": "POST - Generate comic from subject/topic details",
+            "/generate": "POST - Generate comic from subject/topic details (with caching)",
             "/generate-from-file": "POST - Generate comic from uploaded PDF/image",
+            "/store-comicizer": "POST - Store comic metadata in remote database",
+            "/check-comic": "GET - Check if comic exists in database",
+            "/downloads/{filename}": "GET - Download generated PDF",
             "/health": "GET - Check API health"
         }
     }
 
 @app.post("/generate")
 async def generate_from_topic(request: TopicRequest):
-    """Generate comic PDF from topic information"""
+    """Generate comic PDF from topic information and return URL (with caching)"""
     try:
+        # Step 0: Check if comic already exists in remote database
+        print(f"\n=== Comic generation request for topic: {request.topic} ===")
+        print(f"Parameters: level={request.level}, subjectId={request.subjectId}, chapterId={request.chapterId}, topicId={request.topicId}")
+        print("Step 0: Checking for existing comic in database...")
+        
+        existing_url = await check_existing_comic(
+            request.level,
+            request.subjectId,
+            request.chapterId,
+            request.topicId
+        )
+        
+        if existing_url:
+            print(f"Found existing comic! Returning cached URL: {existing_url}")
+            return JSONResponse(content={
+                "success": True,
+                "message": "Comic retrieved from cache",
+                "pdf_url": existing_url,
+                "cached": True
+            })
+        
+        print("No existing comic found. Proceeding with generation...")
+        
         # Create context
-        context = f"Subject: {request.subject}, Class: {request.class_name}, Chapter: {request.chapter}, Topic: {request.topic}"
+        context = f"Subject: {request.subject}, Class/Level: {request.level}, Chapter: {request.chapter}, Topic: {request.topic}"
         
         # Step 1: Analyze
-        print(f"\n=== Starting comic generation for topic: {request.topic} ===")
-        print("Step 1: Analyzing content...")
+        print(f"\nStep 1: Analyzing content...")
         analysis = analyze_content(request.topic, context)
         
         # Step 2: Plan story
@@ -346,16 +530,38 @@ async def generate_from_topic(request: TopicRequest):
         print("\nStep 4: Creating PDF with separate pages...")
         pdf_bytes = create_comic_pdf(pages_data)
         
-        print(f"\n=== Comic generation completed! PDF size: {len(pdf_bytes)} bytes ===\n")
+        # Step 5: Save PDF and get URL
+        filename = f"comic_{request.subject}_{request.topic.replace(' ', '_')}.pdf"
+        pdf_url = save_pdf_to_storage(pdf_bytes, filename)
         
-        # Return PDF
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename=comic_{request.subject}_{request.topic.replace(' ', '_')}.pdf"
-            }
+        print(f"\n=== Comic generation completed! PDF size: {len(pdf_bytes)} bytes ===")
+        
+        # Step 6: Store metadata in remote database
+        print("\nStep 6: Storing metadata in remote database...")
+        store_success = await store_comic_metadata(
+            request.level,
+            request.subjectId,
+            request.chapterId,
+            request.topicId,
+            pdf_url
         )
+        
+        if store_success:
+            print("Metadata stored successfully!")
+        else:
+            print("Warning: Failed to store metadata, but comic was generated successfully")
+        
+        # Return JSON with URL
+        return JSONResponse(content={
+            "success": True,
+            "message": "Comic generated successfully",
+            "pdf_url": pdf_url,
+            "filename": filename,
+            "pages": total_pages,
+            "size_bytes": len(pdf_bytes),
+            "cached": False,
+            "metadata_stored": store_success
+        })
         
     except Exception as e:
         print(f"\n!!! Error in generate_from_topic: {str(e)} !!!")
@@ -365,7 +571,7 @@ async def generate_from_topic(request: TopicRequest):
 
 @app.post("/generate-from-file")
 async def generate_from_file(file: UploadFile = File(...)):
-    """Generate comic PDF from uploaded PDF or image"""
+    """Generate comic PDF from uploaded PDF or image and return URL"""
     try:
         # Validate file type
         if not file.content_type:
@@ -414,16 +620,21 @@ async def generate_from_file(file: UploadFile = File(...)):
         print("\nStep 4: Creating PDF with separate pages...")
         pdf_bytes = create_comic_pdf(pages_data)
         
+        # Step 5: Save PDF and get URL
+        filename = f"comic_{file.filename.rsplit('.', 1)[0]}.pdf"
+        pdf_url = save_pdf_to_storage(pdf_bytes, filename)
+        
         print(f"\n=== Comic generation completed! PDF size: {len(pdf_bytes)} bytes ===\n")
         
-        # Return PDF
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename=comic_{file.filename.rsplit('.', 1)[0]}.pdf"
-            }
-        )
+        # Return JSON with URL
+        return JSONResponse(content={
+            "success": True,
+            "message": "Comic generated successfully",
+            "pdf_url": pdf_url,
+            "filename": filename,
+            "pages": total_pages,
+            "size_bytes": len(pdf_bytes)
+        })
         
     except json.JSONDecodeError as e:
         print(f"\n!!! JSON parsing error: {str(e)} !!!")
@@ -434,6 +645,83 @@ async def generate_from_file(file: UploadFile = File(...)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/store-comicizer")
+async def store_comicizer(request: StoreComicRequest):
+    """Manually store comic metadata in remote database"""
+    try:
+        print(f"\n=== Storing comic metadata ===")
+        print(f"Parameters: level={request.level}, subjectId={request.subjectId}, chapterId={request.chapterId}, topicId={request.topicId}")
+        print(f"URL: {request.url}")
+        
+        success = await store_comic_metadata(
+            request.level,
+            request.subjectId,
+            request.chapterId,
+            request.topicId,
+            request.url
+        )
+        
+        if success:
+            return JSONResponse(content={
+                "success": True,
+                "message": "Comic metadata stored successfully"
+            })
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to store comic metadata in remote database"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\n!!! Error in store_comicizer: {str(e)} !!!")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/check-comic")
+async def check_comic(level: int, subjectId: int, chapterId: int, topicId: int):
+    """Check if a comic exists in the remote database (local GET endpoint that calls remote POST API)"""
+    try:
+        print(f"\n=== Checking for existing comic ===")
+        print(f"Parameters: level={level}, subjectId={subjectId}, chapterId={chapterId}, topicId={topicId}")
+        
+        url = await check_existing_comic(level, subjectId, chapterId, topicId)
+        
+        if url:
+            return JSONResponse(content={
+                "exists": True,
+                "url": url
+            })
+        else:
+            return JSONResponse(content={
+                "exists": False,
+                "url": None
+            })
+            
+    except Exception as e:
+        print(f"\n!!! Error in check_comic: {str(e)} !!!")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/downloads/{filename}")
+async def download_pdf(filename: str):
+    """Download a generated PDF file"""
+    from fastapi.responses import FileResponse
+    
+    file_path = os.path.join(STORAGE_DIR, filename)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(
+        path=file_path,
+        media_type="application/pdf",
+        filename=filename
+    )
+
 @app.get("/health")
 async def health_check():
     return {
@@ -441,5 +729,7 @@ async def health_check():
         "api_configured": bool(API_KEY),
         "max_pages": MAX_PAGES,
         "text_model": TEXT_MODEL,
-        "image_model": IMAGE_MODEL
+        "image_model": IMAGE_MODEL,
+        "storage_dir": STORAGE_DIR,
+        "base_url": BASE_URL
     }
