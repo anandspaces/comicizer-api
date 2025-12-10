@@ -33,10 +33,10 @@ COPY pyproject.toml ./
 RUN uv pip install --system --no-cache .
 
 # Copy application code
-COPY . .
+COPY main.py .
 
-# Create output directory
-RUN mkdir -p /app/output
+# Create output directory with proper permissions
+RUN mkdir -p /app/output && chmod 777 /app/output
 
 # Expose port
 EXPOSE 8040

@@ -51,14 +51,14 @@ temp/
 *.tmp
 
 # Docker
-Dockerfile
 docker-compose.yml
 .dockerignore
 
 # Environment (will be mounted or passed separately)
 .env.example
 
-# Project specific
+# Project specific - these will be generated/mounted
 *.pdf
 comics/
 output/
+generated_comics/
