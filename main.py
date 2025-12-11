@@ -556,11 +556,7 @@ async def generate_from_topic(request: TopicRequest):
             "success": True,
             "message": "Comic generated successfully",
             "pdf_url": pdf_url,
-            "filename": filename,
-            "pages": total_pages,
-            "size_bytes": len(pdf_bytes),
             "cached": False,
-            "metadata_stored": store_success
         })
         
     except Exception as e:
