@@ -8,9 +8,6 @@ services:
       - "8040:8040"
     env_file:
       - .env
-    environment:
-      - STORAGE_DIR=/app/output
-      - BASE_URL=http://localhost:8040
     volumes:
       # Mount output directory for generated PDFs
       - ./output:/app/output
